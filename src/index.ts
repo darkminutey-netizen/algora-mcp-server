@@ -46,10 +46,13 @@ type BountyItemRaw = AlgoraOutput["bounty"]["list"]["items"][number];
  */
 interface BountyItem extends BountyItemRaw {
   // Present at runtime, missing from SDK type declarations
+  reward_formatted?: string;
   tech?: string[];
   task: BountyItemRaw["task"] & {
     status?: string;
     tech?: string[];
+    body?: string;
+    repo_name?: string;
   };
 }
 
@@ -59,7 +62,7 @@ type BountyReward = BountyItem["reward"];
 type AlgoraStatus = "active" | "inactive";
 
 // Our user-facing status vocabulary mapped to Algora's internal status
-type UserStatus = "open" | "active" | "completed" | "all";
+type UserStatus = "open" | "completed" | "all";
 
 // Input types for each tool handler
 interface ListBountiesInput {
@@ -76,10 +79,12 @@ interface GetOrgBountiesInput {
   org: string;
   status?: UserStatus;
   limit?: number;
+  cursor?: string;
 }
 
 interface SearchBountiesInput {
   keyword: string;
+  status?: UserStatus;
   tech?: string;
   min_amount?: number;
   limit?: number;
@@ -111,13 +116,26 @@ interface AlgoraBountyListParams {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Max number of pages to fetch in pagination loops to avoid runaway requests */
+const MAX_PAGES = 5;
+
 /**
  * Maps our user-facing status to Algora's internal status param.
  */
 function toAlgoraStatus(status: UserStatus): AlgoraStatus | undefined {
-  if (status === "open" || status === "active") return "active";
+  if (status === "open") return "active";
   if (status === "completed") return "inactive";
   return undefined; // "all" — no status filter
+}
+
+/**
+ * Clamp a numeric value to a valid range, returning the default if undefined or invalid.
+ */
+function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  if (value === undefined || value === null) return fallback;
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(n)));
 }
 
 /**
@@ -211,10 +229,41 @@ async function fetchBounties(params: AlgoraBountyListParams): Promise<{
     ...(params.rewarded !== undefined ? { rewarded: params.rewarded } : {}),
   };
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result = await algora.bounty.list.query(queryParams as any);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return result as any;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result = await algora.bounty.list.query(queryParams as any);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return result as any;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("fetch") || message.includes("ECONNREFUSED") || message.includes("ETIMEDOUT")) {
+      throw new McpError(ErrorCode.InternalError, "Algora API is unavailable. Please try again later.");
+    }
+    throw err;
+  }
+}
+
+/**
+ * Fetch all available bounties by paginating through results.
+ * Stops after maxPages pages or when there's no next cursor.
+ */
+async function fetchAllBounties(
+  params: Omit<AlgoraBountyListParams, "cursor" | "limit">,
+  maxPages: number = MAX_PAGES
+): Promise<BountyItem[]> {
+  const allItems: BountyItem[] = [];
+  let cursor: string | undefined;
+
+  for (let page = 0; page < maxPages; page++) {
+    const result = await fetchBounties({ ...params, limit: 100, cursor });
+    const items = result.items ?? [];
+    allItems.push(...items);
+
+    if (!result.next_cursor || items.length === 0) break;
+    cursor = result.next_cursor;
+  }
+
+  return allItems;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,26 +276,50 @@ async function handleListBounties(
   const {
     org,
     status = "open",
-    limit = 20,
     cursor,
     min_amount,
     max_amount,
     tech,
   } = input;
 
-  const fetchLimit = Math.min((limit ?? 20) * 3, 100);
+  const limit = clampInt(input.limit, 1, 100, 20);
+  const hasLocalFilters = min_amount !== undefined || max_amount !== undefined || tech !== undefined;
+  const fetchLimit = hasLocalFilters ? Math.min(limit * 3, 100) : limit;
   const algoraStatus = toAlgoraStatus(status);
 
-  const result = await fetchBounties({
-    org,
-    status: algoraStatus,
-    limit: fetchLimit,
-    cursor,
-  });
+  let items: BountyItem[] = [];
+  let nextCursor: string | null | undefined;
 
-  let items = result.items ?? [];
-  items = applyLocalFilters(items, { min_amount, max_amount, tech });
-  items = items.slice(0, limit);
+  if (hasLocalFilters) {
+    // Fetch extra to compensate for local filtering, paginate if needed
+    let pageCursor = cursor;
+    let pagesLeft = MAX_PAGES;
+    while (items.length < limit && pagesLeft > 0) {
+      const result = await fetchBounties({
+        org,
+        status: algoraStatus,
+        limit: fetchLimit,
+        cursor: pageCursor,
+      });
+      const pageItems = result.items ?? [];
+      const filtered = applyLocalFilters(pageItems, { min_amount, max_amount, tech });
+      items.push(...filtered);
+      nextCursor = result.next_cursor;
+      if (!result.next_cursor || pageItems.length === 0) break;
+      pageCursor = result.next_cursor;
+      pagesLeft--;
+    }
+    items = items.slice(0, limit);
+  } else {
+    const result = await fetchBounties({
+      org,
+      status: algoraStatus,
+      limit: fetchLimit,
+      cursor,
+    });
+    items = result.items ?? [];
+    nextCursor = result.next_cursor;
+  }
 
   if (items.length === 0) {
     return {
@@ -261,8 +334,8 @@ async function handleListBounties(
 
   const header = `## Algora Bounties — ${items.length} results\n\n`;
   const body = items.map(formatBounty).join("\n");
-  const footer = result.next_cursor
-    ? `\n---\n*More results available. Use \`cursor: "${result.next_cursor}"\` to get the next page.*`
+  const footer = nextCursor
+    ? `\n---\n*More results available. Use \`cursor: "${nextCursor}"\` to get the next page.*`
     : "\n---\n*End of results.*";
 
   return { content: [{ type: "text", text: header + body + footer }] };
@@ -271,13 +344,15 @@ async function handleListBounties(
 async function handleGetOrgBounties(
   input: GetOrgBountiesInput
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-  const { org, status = "open", limit = 50 } = input;
+  const { org, status = "open", cursor } = input;
+  const limit = clampInt(input.limit, 1, 100, 50);
   const algoraStatus = toAlgoraStatus(status);
 
   const result = await fetchBounties({
     org,
     status: algoraStatus,
-    limit: Math.min(limit, 100),
+    limit,
+    cursor,
   });
 
   const items = result.items ?? [];
@@ -296,20 +371,23 @@ async function handleGetOrgBounties(
   const totalValue = items.reduce((sum, b) => sum + rewardDollars(b.reward), 0);
   const header = `## ${org} Bounties\n\n**${items.length} bounties** | **Total: $${totalValue.toLocaleString()}**\n\n`;
   const body = items.map(formatBounty).join("\n");
+  const footer = result.next_cursor
+    ? `\n---\n*More results available. Use \`cursor: "${result.next_cursor}"\` to get the next page.*`
+    : "";
 
-  return { content: [{ type: "text", text: header + body }] };
+  return { content: [{ type: "text", text: header + body + footer }] };
 }
 
 async function handleSearchBounties(
   input: SearchBountiesInput
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-  const { keyword, tech, min_amount, limit = 30 } = input;
+  const { keyword, status = "open", tech, min_amount } = input;
+  const limit = clampInt(input.limit, 1, 100, 30);
+  const algoraStatus = toAlgoraStatus(status);
 
-  // Fetch a broad active set and filter locally
-  const result = await fetchBounties({ status: "active", limit: 100 });
+  const allItems = await fetchAllBounties({ status: algoraStatus });
 
-  let items = result.items ?? [];
-  items = applyLocalFilters(items, { keyword, tech, min_amount });
+  let items = applyLocalFilters(allItems, { keyword, tech, min_amount });
   items = items.slice(0, limit);
 
   if (items.length === 0) {
@@ -332,12 +410,13 @@ async function handleSearchBounties(
 async function handleGetTopBounties(
   input: GetTopBountiesInput
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-  const { tech, min_amount = 100, limit = 10 } = input;
+  const min_amount = typeof input.min_amount === "number" && Number.isFinite(input.min_amount) ? input.min_amount : 100;
+  const limit = clampInt(input.limit, 1, 100, 10);
+  const { tech } = input;
 
-  const result = await fetchBounties({ status: "active", limit: 100 });
+  const allItems = await fetchAllBounties({ status: "active" });
 
-  let items = result.items ?? [];
-  items = applyLocalFilters(items, { min_amount, tech });
+  let items = applyLocalFilters(allItems, { min_amount, tech });
 
   // Sort by reward descending
   items.sort((a, b) => rewardDollars(b.reward) - rewardDollars(a.reward));
@@ -366,13 +445,7 @@ async function handleGetBountyStats(
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
   const { org } = input;
 
-  const result = await fetchBounties({
-    org,
-    status: "active",
-    limit: 100,
-  });
-
-  const items = result.items ?? [];
+  const items = await fetchAllBounties({ org, status: "active" });
 
   if (items.length === 0) {
     return {
@@ -490,8 +563,8 @@ const TOOLS = [
         },
         status: {
           type: "string",
-          enum: ["open", "active", "completed", "all"],
-          description: "Bounty status. 'open'/'active' = claimable now. Default: 'open'.",
+          enum: ["open", "completed", "all"],
+          description: "Bounty status. 'open' = claimable now. Default: 'open'.",
         },
         limit: {
           type: "number",
@@ -506,10 +579,12 @@ const TOOLS = [
         min_amount: {
           type: "number",
           description: "Minimum bounty amount in USD (e.g., 200 for $200+).",
+          minimum: 0,
         },
         max_amount: {
           type: "number",
           description: "Maximum bounty amount in USD.",
+          minimum: 0,
         },
         tech: {
           type: "string",
@@ -522,7 +597,7 @@ const TOOLS = [
   {
     name: "get_org_bounties",
     description:
-      "Get all open bounties for a specific organization on Algora. Use this to check if a known project (cal.com, supabase, etc.) has active bounties you can claim.",
+      "Get all open bounties for a specific organization on Algora. Use this to check if a known project (cal.com, supabase, etc.) has active bounties you can claim. Supports pagination via cursor.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -533,12 +608,18 @@ const TOOLS = [
         },
         status: {
           type: "string",
-          enum: ["open", "active", "completed", "all"],
+          enum: ["open", "completed", "all"],
           description: "Bounty status filter. Default: 'open'.",
         },
         limit: {
           type: "number",
           description: "Max results (1–100). Default: 50.",
+          minimum: 1,
+          maximum: 100,
+        },
+        cursor: {
+          type: "string",
+          description: "Pagination cursor from previous response's next_cursor.",
         },
       },
       required: ["org"],
@@ -547,13 +628,18 @@ const TOOLS = [
   {
     name: "search_bounties",
     description:
-      "Search open bounties by keyword. Searches titles, descriptions, repo names, and org handles. Useful for finding bounties in a specific domain (e.g., 'database', 'MCP', 'authentication').",
+      "Search bounties by keyword. Searches titles, descriptions, repo names, and org handles. Useful for finding bounties in a specific domain (e.g., 'database', 'MCP', 'authentication'). Searches open bounties by default; set status to search completed or all.",
     inputSchema: {
       type: "object" as const,
       properties: {
         keyword: {
           type: "string",
           description: "Search term to match against bounty content.",
+        },
+        status: {
+          type: "string",
+          enum: ["open", "completed", "all"],
+          description: "Bounty status to search. Default: 'open'.",
         },
         tech: {
           type: "string",
@@ -562,10 +648,13 @@ const TOOLS = [
         min_amount: {
           type: "number",
           description: "Minimum bounty USD amount.",
+          minimum: 0,
         },
         limit: {
           type: "number",
-          description: "Max results. Default: 30.",
+          description: "Max results (1–100). Default: 30.",
+          minimum: 1,
+          maximum: 100,
         },
       },
       required: ["keyword"],
@@ -585,10 +674,13 @@ const TOOLS = [
         min_amount: {
           type: "number",
           description: "Minimum USD amount to include. Default: 100.",
+          minimum: 0,
         },
         limit: {
           type: "number",
-          description: "How many top bounties to return. Default: 10.",
+          description: "How many top bounties to return (1–100). Default: 10.",
+          minimum: 1,
+          maximum: 100,
         },
       },
       required: [],
