@@ -97,7 +97,7 @@ Calls `get_bounty_stats({})` and returns counts, total, average, breakdown by te
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `org` | string | Yes | Org slug from Algora URL |
-| `status` | string | No | Default: `"open"` |
+| `status` | `"open"` \| `"completed"` \| `"all"` | No | Default: `"open"` |
 | `limit` | number | No | Default: 50 |
 
 ### `search_bounties`
@@ -135,8 +135,4 @@ npm run typecheck  # Type check without emitting
 
 The server uses stdio transport (standard MCP convention) — no HTTP server, no port, no configuration. It communicates with the MCP client through stdin/stdout and connects to Algora's public API (no auth required).
 
-The `@algora/sdk` tRPC client handles API calls. Local filtering is applied in-memory for features the API doesn't natively support (keyword search, min/max amount).
-
-## License
-
-MIT
+The `@algora/sdk` tRPC client handles API calls. Local filtering is applied in-memory for features the API doesn't natively support.
